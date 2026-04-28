@@ -48,9 +48,28 @@ Export:
 
 ## 🖼️ Demo
 
+### Bronchial branch parsing
+
 Below shows how the algorithm converts an **unsegmented bronchial tree** into labeled anatomical branches:
 
 ![Bronchial Branch Parsing](DemoImg/Bronchial%20Branch%20Parsing.jpg)
+
+---
+
+### Clinical visualization benefit
+
+The colorized airway branches significantly improve interpretability when reviewing CT in different views:
+
+- Axial  
+- Coronal  
+- Sagittal  
+
+This allows faster identification of bronchial segments (e.g., B1–B10) during image navigation.
+
+![Bronchial Branch Parsing 2](DemoImg/Bronchial%20Branch%20Parsing%202.jpg)
+
+🎥 Video demonstration:  
+https://youtu.be/xXrjiTo91TU
 
 ---
 
