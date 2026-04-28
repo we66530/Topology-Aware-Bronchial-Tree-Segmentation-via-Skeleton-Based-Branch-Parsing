@@ -1,0 +1,773 @@
+#!/usr/bin/env python
+"""
+Bronchial Branch Labeler
+========================
+
+A lightweight utility for anatomical labeling of bronchial-tree branches from a
+binary airway segmentation stored as NRRD / Slicer .seg.nrrd.
+
+Pipeline
+--------
+1. Load a binary bronchial-tree mask.
+2. Skeletonize the airway using kimimaro TEASAR.
+3. Build a graph from the airway skeleton.
+4. Trace and classify major bronchial branches using graph topology and PCA-based
+   anatomical directions.
+5. Assign airway voxels to the nearest labeled skeleton branch.
+6. Export a 3D Slicer-compatible .seg.nrrd and a text label table.
+
+Example
+-------
+python bronchial_branch_labeler.py \
+    --input "D:/LyNoS_dataset/Benchmark/Pat2/lung_vessels_segmentation/lung_vessels_segmentation_bronchial_ori.seg.nrrd" \
+    --ct "D:/LyNoS_dataset/Benchmark/Pat2/pat2_data.nii.gz" \
+    --output "D:/LyNoS_dataset/Benchmark/Pat2/lung_vessels_segmentation/bronchial_BRANCHES.seg.nrrd"
+
+Notes
+-----
+- The input airway mask is expected to contain airway voxels with value 1.
+- AP orientation may vary between datasets. Use --ap-sign -1 if anterior/posterior
+  assignment is reversed.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+import kimimaro
+import nibabel as nib
+import nrrd
+import numpy as np
+from scipy.spatial import cKDTree
+from sklearn.decomposition import PCA
+
+
+# bid -> (anatomical name, RGB color for Slicer)
+LABELS: Dict[int, Tuple[str, Tuple[float, float, float]]] = {
+    0: ("Trachea", (1.00, 1.00, 0.00)),
+    1: ("LMB", (0.00, 0.00, 1.00)),
+    2: ("RMB", (1.00, 0.00, 0.00)),
+    3: ("RUL", (1.00, 0.50, 0.00)),
+    4: ("BI", (0.60, 0.00, 0.60)),
+    5: ("LUL", (0.00, 1.00, 1.00)),
+    6: ("LLL", (0.00, 0.60, 0.00)),
+    7: ("Rt_B1", (1.00, 0.00, 0.20)),
+    8: ("Rt_B2", (1.00, 0.30, 0.30)),
+    9: ("Rt_B3", (1.00, 0.60, 0.60)),
+    10: ("RML", (0.80, 0.00, 0.80)),
+    11: ("RLL", (0.50, 0.00, 0.50)),
+    12: ("UDB", (0.00, 1.00, 0.80)),
+    13: ("LIN", (0.00, 0.80, 0.50)),
+    14: ("Rt_B2+B3", (1.00, 0.45, 0.10)),
+    15: ("Rt_B1+B2", (1.00, 0.15, 0.65)),
+    16: ("Rt_B1+B3", (0.75, 0.10, 0.10)),
+    17: ("Lt_B1", (0.10, 0.70, 1.00)),
+    18: ("Lt_B2", (0.10, 0.45, 0.90)),
+    19: ("Lt_B3", (0.30, 0.85, 1.00)),
+    20: ("Lt_B2+B3", (0.00, 0.55, 0.85)),
+    21: ("Lt_B1+B2", (0.20, 0.35, 0.85)),
+    22: ("Lt_B1+B3", (0.00, 0.75, 0.65)),
+    23: ("Rt_B4", (0.90, 0.10, 0.90)),
+    24: ("Rt_B5", (0.95, 0.45, 0.95)),
+    25: ("Rt_B4+B5", (0.75, 0.25, 0.75)),
+    26: ("Lt_B4", (0.10, 0.95, 0.95)),
+    27: ("Lt_B5", (0.35, 0.75, 0.95)),
+    28: ("Lt_B4+B5", (0.15, 0.65, 0.75)),
+    29: ("Rt_B6", (0.95, 0.20, 0.05)),
+    30: ("Rt_B7", (0.95, 0.45, 0.05)),
+    31: ("Rt_B8", (0.95, 0.70, 0.05)),
+    32: ("Rt_B9", (0.65, 0.15, 0.05)),
+    33: ("Rt_B10", (0.45, 0.05, 0.02)),
+    34: ("Rt_B9+B10", (0.70, 0.30, 0.10)),
+    35: ("Lt_B6", (0.05, 0.55, 1.00)),
+    36: ("Lt_B8", (0.20, 0.75, 1.00)),
+    37: ("Lt_B9", (0.00, 0.45, 0.80)),
+    38: ("Lt_B10", (0.00, 0.25, 0.60)),
+    39: ("Lt_B9+B10", (0.10, 0.45, 0.65)),
+}
+NAME_TO_BID = {name: bid for bid, (name, _) in LABELS.items()}
+
+DEFAULT_EXPORT_BIDS = [
+    0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 17,
+    20, 23, 24, 26, 27, 29, 30, 31, 32, 33, 35, 36, 37, 38,
+]
+
+
+class BronchialBranchLabeler:
+    def __init__(self, mask: np.ndarray, ap_sign: float = 1.0, min_subtree_size: int = 5):
+        self.mask = mask.astype(bool)
+        self.ap_sign = float(ap_sign)
+        self.min_subtree_size = int(min_subtree_size)
+
+        self.verts: np.ndarray
+        self.edges: np.ndarray
+        self.adj: List[List[int]]
+        self.degree: np.ndarray
+        self.dist: np.ndarray
+        self.pc1: np.ndarray
+        self.pc2: np.ndarray
+        self.pc3: np.ndarray
+        self.carina: int
+
+    def run(self) -> Dict[int, Set[int]]:
+        self._skeletonize()
+        self._build_graph()
+        self._estimate_axes()
+        self._find_carina()
+        return self._discover_segments()
+
+    def _skeletonize(self) -> None:
+        skeletons = kimimaro.skeletonize(
+            self.mask.astype(np.uint8),
+            teasar_params={
+                "scale": 1.0,
+                "const": 50,
+                "pdrf_exponent": 4,
+                "pdrf_scale": 100000,
+            },
+            dust_threshold=10,
+            anisotropy=(1, 1, 1),
+            fix_branching=True,
+            fix_borders=True,
+        )
+        if not skeletons:
+            raise RuntimeError("No skeleton was generated. Please check the input airway mask.")
+        main = max(skeletons.values(), key=lambda skel: skel.vertices.shape[0])
+        self.verts = main.vertices.astype(np.float32)
+        self.edges = main.edges.astype(np.int64)
+
+    def _build_graph(self) -> None:
+        self.adj = [[] for _ in range(len(self.verts))]
+        for a, b in self.edges:
+            self.adj[int(a)].append(int(b))
+            self.adj[int(b)].append(int(a))
+        self.degree = np.array([len(nbs) for nbs in self.adj])
+
+    def _estimate_axes(self) -> None:
+        pca = PCA(n_components=3).fit(self.verts)
+        self.pc1, self.pc2, self.pc3 = pca.components_
+
+    def _find_carina(self) -> None:
+        branch_idx = np.where(self.degree >= 3)[0]
+        if len(branch_idx) == 0:
+            raise RuntimeError("No graph branching point was found.")
+        xy_center = self.verts[:, :2].mean(axis=0)
+        self.carina = int(branch_idx[np.argmin(np.linalg.norm(self.verts[branch_idx, :2] - xy_center, axis=1))])
+        self.dist = self.bfs_distance(self.carina)
+
+    def unit_vec(self, a: int, b: int) -> np.ndarray:
+        v = self.verts[a] - self.verts[b]
+        return v / (np.linalg.norm(v) + 1e-8)
+
+    def bfs_distance(self, root: int) -> np.ndarray:
+        dist = np.full(len(self.verts), -1, dtype=np.int32)
+        dist[root] = 0
+        queue = deque([root])
+        while queue:
+            u = queue.popleft()
+            for v in self.adj[u]:
+                if dist[v] == -1:
+                    dist[v] = dist[u] + 1
+                    queue.append(v)
+        return dist
+
+    def shortest_path(self, start: Optional[int], end: Optional[int]) -> Optional[List[int]]:
+        if start is None or end is None:
+            return None
+        parent = {int(start): -1}
+        queue = deque([int(start)])
+        while queue:
+            u = queue.popleft()
+            if u == end:
+                break
+            for v in self.adj[u]:
+                if v not in parent:
+                    parent[v] = u
+                    queue.append(v)
+        if end not in parent:
+            return None
+
+        path, cur = [], int(end)
+        while cur != -1:
+            path.append(cur)
+            cur = parent[cur]
+        return path[::-1]
+
+    def trace_until_branch(self, start: int, parent: int) -> Optional[int]:
+        cur, prev = int(start), int(parent)
+        while True:
+            if self.degree[cur] >= 3:
+                return cur
+            nxts = [n for n in self.adj[cur] if n != prev and self.dist[n] > self.dist[cur]]
+            if not nxts:
+                return None
+            cur, prev = max(nxts, key=lambda x: self.dist[x]), cur
+
+    def first_branch(self, node: int, parent: int) -> Optional[int]:
+        candidates = [
+            self.trace_until_branch(n, node)
+            for n in self.adj[node]
+            if n != parent and self.dist[n] > self.dist[node]
+        ]
+        candidates = [c for c in candidates if c is not None]
+        return min(candidates, key=lambda x: self.dist[x]) if candidates else None
+
+    def branch_children(self, node: int, parent: int) -> List[int]:
+        return list({
+            c for c in (
+                self.trace_until_branch(n, node)
+                for n in self.adj[node]
+                if n != parent and self.dist[n] > self.dist[node]
+            )
+            if c is not None
+        })
+
+    def split_by_up(self, children: Sequence[int], parent: int) -> Tuple[Optional[int], Optional[int]]:
+        if len(children) < 2:
+            return None, None
+        scored = sorted(
+            ((c, float(np.dot(self.unit_vec(c, parent), self.pc1))) for c in children),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return scored[0][0], scored[-1][0]
+
+    def trace_component(
+        self,
+        seed: int,
+        blocked: Optional[Iterable[int]] = None,
+        allowed: Optional[Iterable[int]] = None,
+    ) -> Set[int]:
+        blocked_set = set(blocked or [])
+        allowed_set = None if allowed is None else set(allowed)
+        visited, stack = set(), [int(seed)]
+        while stack:
+            cur = stack.pop()
+            if cur in visited or cur in blocked_set or (allowed_set is not None and cur not in allowed_set):
+                continue
+            visited.add(cur)
+            for n in self.adj[cur]:
+                if n not in visited and n not in blocked_set and (allowed_set is None or n in allowed_set):
+                    stack.append(n)
+        return visited
+
+    def direction_info(self, nodes: Set[int], root_node: int, seed: Optional[int] = None, attach: Optional[int] = None) -> dict:
+        node_list = list(nodes)
+        pts = self.verts[node_list]
+        root = self.verts[root_node]
+        d = np.linalg.norm(pts - root, axis=1) + 1e-6
+        w = d ** 1.5
+        wc = (pts * w[:, None]).sum(axis=0) / w.sum()
+        vec = wc - root
+        vec = vec / (np.linalg.norm(vec) + 1e-8)
+        return {
+            "seed": seed,
+            "attach": attach,
+            "nodes": nodes,
+            "weighted_centroid": wc,
+            "vec": vec,
+            "up_score": float(np.dot(vec, self.pc1)),
+            "ap_score": float(self.ap_sign * np.dot(vec, self.pc3)),
+            "x_score": float(vec[0]),
+            "z_score": float(wc[2]),
+            "size": len(nodes),
+            "farthest": node_list[int(np.argmax(d))],
+        }
+
+    def distal_subtrees(self, root_node: int, parent_node: int, keep: Optional[int] = None) -> List[dict]:
+        infos = []
+        for seed in [n for n in self.adj[root_node] if n != parent_node and self.dist[n] > self.dist[root_node]]:
+            nodes = self.trace_component(seed, blocked={root_node})
+            if len(nodes) >= self.min_subtree_size:
+                infos.append(self.direction_info(nodes, root_node, seed=seed, attach=root_node))
+        infos.sort(key=lambda x: x["size"], reverse=True)
+        return infos[:keep] if keep else infos
+
+    def collect_side_subtrees(
+        self,
+        trunk_nodes: Sequence[int],
+        extra_blocked: Optional[Iterable[int]] = None,
+    ) -> List[dict]:
+        trunk_set = set(trunk_nodes)
+        blocked = trunk_set | set(extra_blocked or [])
+        out, seen = [], set()
+        for attach in trunk_nodes:
+            for nb in self.adj[attach]:
+                if nb in blocked:
+                    continue
+                nodes = self.trace_component(nb, blocked=blocked)
+                key = frozenset(nodes)
+                if len(nodes) < self.min_subtree_size or key in seen:
+                    continue
+                seen.add(key)
+                out.append(self.direction_info(nodes, attach, seed=nb, attach=attach))
+        return out
+
+    def trace_trachea(self) -> List[int]:
+        path = [self.carina]
+        current, prev = self.carina, None
+        while True:
+            neighbors = self.adj[current]
+            if prev is not None:
+                neighbors = [n for n in neighbors if n != prev]
+            if not neighbors:
+                break
+
+            best, best_score = None, -1e9
+            for n in neighbors:
+                vec = self.unit_vec(n, current)
+                score = float(np.dot(vec, self.pc1))
+                if score > best_score:
+                    best_score, best = score, n
+            if best is None or best_score < 0.15:
+                break
+            path.append(best)
+            prev, current = current, best
+        return path
+
+    def classify_b123(self, root_node: int, parent_node: int, side_prefix: str) -> Dict[str, Set[int]]:
+        infos = self.distal_subtrees(root_node, parent_node, keep=3)
+        labels = {
+            "B1": f"{side_prefix}_B1",
+            "B2": f"{side_prefix}_B2",
+            "B3": f"{side_prefix}_B3",
+            "B23": f"{side_prefix}_B2+B3",
+            "B12": f"{side_prefix}_B1+B2",
+            "B13": f"{side_prefix}_B1+B3",
+        }
+
+        if len(infos) >= 3:
+            b1 = max(infos, key=lambda x: x["up_score"])
+            rest = [x for x in infos if x["seed"] != b1["seed"]]
+            b3 = max(rest, key=lambda x: x["ap_score"])
+            b2 = min(rest, key=lambda x: x["ap_score"])
+            assignment = {labels["B1"]: b1, labels["B2"]: b2, labels["B3"]: b3}
+        elif len(infos) == 2:
+            up_sorted = sorted(infos, key=lambda x: x["up_score"], reverse=True)
+            ap_sorted = sorted(infos, key=lambda x: x["ap_score"], reverse=True)
+            if up_sorted[0]["up_score"] > 0.45 and up_sorted[0]["up_score"] - up_sorted[1]["up_score"] > 0.20:
+                assignment = {labels["B1"]: up_sorted[0], labels["B23"]: up_sorted[1]}
+            elif ap_sorted[0]["ap_score"] > 0.35 and ap_sorted[0]["ap_score"] - ap_sorted[1]["ap_score"] > 0.20:
+                assignment = {labels["B3"]: ap_sorted[0], labels["B12"]: ap_sorted[1]}
+            elif ap_sorted[1]["ap_score"] < -0.35 and ap_sorted[0]["ap_score"] - ap_sorted[1]["ap_score"] > 0.20:
+                assignment = {labels["B2"]: ap_sorted[1], labels["B13"]: ap_sorted[0]}
+            else:
+                assignment = {labels["B1"]: up_sorted[0], labels["B23"]: up_sorted[1]}
+        else:
+            return {}
+        return {label: info["nodes"] for label, info in assignment.items()}
+
+    def classify_b45(self, root_node: int, parent_node: int, side_prefix: str) -> Dict[str, Set[int]]:
+        infos = self.distal_subtrees(root_node, parent_node, keep=2)
+        if len(infos) >= 2:
+            ap_sorted = sorted(infos, key=lambda x: x["ap_score"])
+            assignment = {f"{side_prefix}_B4": ap_sorted[0], f"{side_prefix}_B5": ap_sorted[-1]}
+        elif len(infos) == 1:
+            assignment = {f"{side_prefix}_B4+B5": infos[0]}
+        else:
+            return {}
+        return {label: info["nodes"] for label, info in assignment.items()}
+
+    def trunk_with_distal_extension(self, prox_node: int, root_node: int) -> List[int]:
+        base_path = self.shortest_path(prox_node, root_node) or []
+        seeds = [n for n in self.adj[root_node] if n not in base_path and self.dist[n] > self.dist[root_node]]
+        distal_nodes: List[int] = []
+        if seeds:
+            comps = [(s, self.trace_component(s, blocked=set(base_path))) for s in seeds]
+            _, trunk_nodes = max(comps, key=lambda x: len(x[1]))
+            terminal = max(trunk_nodes, key=lambda x: self.dist[x])
+            distal_nodes = self.shortest_path(root_node, terminal) or []
+        return list(dict.fromkeys(base_path + distal_nodes))
+
+    @staticmethod
+    def merge_used_nodes(segment_nodes: Dict[int, Set[int]]) -> Set[int]:
+        used: Set[int] = set()
+        for nodes in segment_nodes.values():
+            used |= set(nodes)
+        return used
+
+    @staticmethod
+    def add_named_nodes(segment_nodes: Dict[int, Set[int]], node_map: Dict[str, Set[int]]) -> None:
+        for label_name, nodes in node_map.items():
+            bid = NAME_TO_BID.get(label_name)
+            if bid is not None and nodes:
+                segment_nodes[bid] = set(nodes)
+
+    @staticmethod
+    def merge_trunk_extension(
+        segment_nodes: Dict[int, Set[int]],
+        target_bid: int,
+        node_map: Dict[str, Set[int]],
+        preferred_keys: Sequence[str],
+    ) -> None:
+        for key in preferred_keys:
+            nodes = node_map.get(key)
+            if nodes:
+                segment_nodes.setdefault(target_bid, set()).update(nodes)
+                return
+
+    def classify_lower_lobe(
+        self,
+        side_prefix: str,
+        prox_node: int,
+        lower_node: int,
+        already_used_nodes: Set[int],
+        terminal_sort_key: str,
+    ) -> Dict[str, Set[int]]:
+        node_map: Dict[str, Set[int]] = {}
+        trunk = self.trunk_with_distal_extension(prox_node, lower_node)
+        middle = self.collect_side_subtrees(trunk, extra_blocked=already_used_nodes)
+        if not middle:
+            return node_map
+
+        middle_by_z = sorted(middle, key=lambda x: x["z_score"], reverse=True)
+        b6_infos = [middle_by_z[0]]
+        if len(middle_by_z) >= 2:
+            z_gap = abs(middle_by_z[0]["z_score"] - middle_by_z[1]["z_score"])
+            if z_gap < 25 and middle_by_z[1]["ap_score"] < 0:
+                b6_infos.append(middle_by_z[1])
+
+        node_map[f"{side_prefix}_B6"] = set().union(*(x["nodes"] for x in b6_infos))
+        used_seeds = {x["seed"] for x in b6_infos}
+        remaining = [x for x in middle_by_z if x["seed"] not in used_seeds]
+
+        b8_info = None
+        if side_prefix == "Rt":
+            if len(remaining) >= 2:
+                assignments = [("Rt_B7", remaining[0]), ("Rt_B8", remaining[1])]
+            elif len(remaining) == 1:
+                one = remaining[0]
+                assignments = [("Rt_B7" if one["ap_score"] > abs(one["x_score"]) else "Rt_B8", one)]
+            else:
+                assignments = []
+        else:
+            assignments = [("Lt_B8", remaining[0])] if remaining else []
+
+        for label, info in assignments:
+            node_map[label] = info["nodes"]
+            if label.endswith("B8"):
+                b8_info = info
+
+        if b8_info is not None:
+            self.classify_terminal_b9b10(
+                side_prefix=side_prefix,
+                prox_node=prox_node,
+                lower_node=lower_node,
+                b8_info=b8_info,
+                already_used_nodes=already_used_nodes,
+                current_node_map=node_map,
+                node_map=node_map,
+                sort_key=terminal_sort_key,
+            )
+        return node_map
+
+    def classify_terminal_b9b10(
+        self,
+        side_prefix: str,
+        prox_node: int,
+        lower_node: int,
+        b8_info: dict,
+        already_used_nodes: Set[int],
+        current_node_map: Dict[str, Set[int]],
+        node_map: Dict[str, Set[int]],
+        sort_key: str,
+    ) -> None:
+        b8_attach = b8_info["attach"]
+        trunk_to_b8 = self.shortest_path(lower_node, b8_attach)
+        if trunk_to_b8:
+            node_map[f"{side_prefix}_trunk_to_B8_attach"] = set(trunk_to_b8)
+
+        upstream = set(self.shortest_path(prox_node, b8_attach) or [])
+        blocked = upstream | set(already_used_nodes)
+        for nodes in current_node_map.values():
+            blocked |= set(nodes)
+
+        comps = []
+        for nb in self.adj[b8_attach]:
+            if nb in blocked:
+                continue
+            nodes = self.trace_component(nb, blocked=blocked)
+            if len(nodes) >= self.min_subtree_size:
+                comps.append(self.direction_info(nodes, b8_attach, seed=nb, attach=b8_attach))
+        if not comps:
+            return
+
+        territory_info = max(comps, key=lambda x: x["size"])
+        territory = set(territory_info["nodes"])
+        branch_cands = [n for n in territory if sum(1 for nb in self.adj[n] if nb in territory) >= 3]
+
+        if not branch_cands:
+            node_map[f"{side_prefix}_B9+B10"] = territory
+            return
+
+        split_node = min(branch_cands, key=lambda x: self.dist[x])
+        trunk_to_split = self.shortest_path(lower_node, split_node)
+        if trunk_to_split and side_prefix == "Rt":
+            node_map[f"{side_prefix}_trunk_to_B9B10_split"] = set(trunk_to_split)
+
+        path_to_split = self.shortest_path(b8_attach, split_node) or []
+        upstream_prev = path_to_split[-2] if len(path_to_split) >= 2 else None
+        allowed = territory - {split_node}
+
+        terminal = []
+        for nb in self.adj[split_node]:
+            if nb == upstream_prev or nb not in territory:
+                continue
+            nodes = self.trace_component(nb, allowed=allowed)
+            if len(nodes) >= self.min_subtree_size:
+                terminal.append(self.direction_info(nodes, split_node, seed=nb, attach=split_node))
+
+        if len(terminal) >= 2:
+            sorted_terms = sorted(terminal, key=lambda x: x[sort_key])
+            if side_prefix == "Rt":
+                b9, b10 = sorted_terms[0], sorted_terms[-1]
+            else:
+                b10, b9 = sorted_terms[0], sorted_terms[-1]
+            node_map[f"{side_prefix}_B9"] = b9["nodes"]
+            node_map[f"{side_prefix}_B10"] = b10["nodes"]
+        elif len(terminal) == 1:
+            node_map[f"{side_prefix}_B9+B10"] = terminal[0]["nodes"]
+        else:
+            node_map[f"{side_prefix}_B9+B10"] = territory_info["nodes"]
+
+    def _discover_segments(self) -> Dict[int, Set[int]]:
+        neighbors = self.adj[self.carina]
+        dirs = [self.unit_vec(n, self.carina) for n in neighbors]
+        l2_a, l2_b, _ = min(
+            ((neighbors[i], neighbors[j], float(np.dot(dirs[i], dirs[j])))
+             for i in range(len(neighbors)) for j in range(i + 1, len(neighbors))),
+            key=lambda x: x[2],
+        )
+
+        l3_a, l3_b = self.first_branch(l2_a, self.carina), self.first_branch(l2_b, self.carina)
+        if l3_a is None or l3_b is None:
+            raise RuntimeError("Failed to identify main bronchial branching nodes.")
+
+        if np.dot(self.verts[l3_a] - self.verts[self.carina], self.pc2) < np.dot(self.verts[l3_b] - self.verts[self.carina], self.pc2):
+            lmb_l3, rmb_l3, lmb_l2, rmb_l2 = l3_a, l3_b, l2_a, l2_b
+        else:
+            lmb_l3, rmb_l3, lmb_l2, rmb_l2 = l3_b, l3_a, l2_b, l2_a
+
+        raw_lul, raw_lll = self.split_by_up(self.branch_children(lmb_l3, lmb_l2), lmb_l3)
+        raw_rul, raw_bi = self.split_by_up(self.branch_children(rmb_l3, rmb_l2), rmb_l3)
+
+        # Semantic swap retained from the validated working version.
+        lmb_node, rmb_node = rmb_l3, lmb_l3
+        rul_node, bi_node = raw_lul, raw_lll
+        lul_node, lll_node = raw_rul, raw_bi
+
+        if None in [rul_node, bi_node, lul_node, lll_node]:
+            raise RuntimeError("Failed to identify lobar bronchial nodes.")
+
+        rul_map = self.classify_b123(rul_node, rmb_node, "Rt")
+        rml, rll = self.split_by_up(self.branch_children(bi_node, rmb_node), bi_node)
+        udb, lin = self.split_by_up(self.branch_children(lul_node, lmb_node), lul_node)
+
+        udb_map = self.classify_b123(udb, lul_node, "Lt") if udb is not None else {}
+        rml_map = self.classify_b45(rml, bi_node, "Rt") if rml is not None else {}
+        lin_map = self.classify_b45(lin, lul_node, "Lt") if lin is not None else {}
+
+        segment_nodes: Dict[int, Set[int]] = {0: set(self.trace_trachea())}
+        base_paths = {
+            1: (self.carina, lmb_node),
+            2: (self.carina, rmb_node),
+            3: (rmb_node, rul_node),
+            4: (rmb_node, bi_node),
+            5: (lmb_node, lul_node),
+            6: (lmb_node, lll_node),
+            10: (bi_node, rml),
+            11: (bi_node, rll),
+            12: (lul_node, udb),
+            13: (lul_node, lin),
+        }
+
+        for bid, (start, end) in base_paths.items():
+            path = self.shortest_path(start, end)
+            if path:
+                segment_nodes[bid] = set(path)
+
+        for node_map in (rul_map, udb_map, rml_map, lin_map):
+            self.add_named_nodes(segment_nodes, node_map)
+
+        if rll is not None:
+            rll_map = self.classify_lower_lobe(
+                side_prefix="Rt",
+                prox_node=bi_node,
+                lower_node=rll,
+                already_used_nodes=self.merge_used_nodes(segment_nodes),
+                terminal_sort_key="x_score",
+            )
+            self.merge_trunk_extension(segment_nodes, 11, rll_map, ["Rt_trunk_to_B9B10_split", "Rt_trunk_to_B8_attach"])
+            self.add_named_nodes(segment_nodes, rll_map)
+
+        if lll_node is not None:
+            lll_map = self.classify_lower_lobe(
+                side_prefix="Lt",
+                prox_node=lmb_node,
+                lower_node=lll_node,
+                already_used_nodes=self.merge_used_nodes(segment_nodes),
+                terminal_sort_key="ap_score",
+            )
+            self.merge_trunk_extension(segment_nodes, 6, lll_map, ["Lt_trunk_to_B8_attach"])
+            self.add_named_nodes(segment_nodes, lll_map)
+
+        return {bid: nodes for bid, nodes in segment_nodes.items() if bid in LABELS and nodes}
+
+
+def load_airway_mask(input_path: Path, airway_value: int = 1) -> Tuple[np.ndarray, dict]:
+    data, header = nrrd.read(str(input_path))
+    return data == airway_value, header
+
+
+def build_export_items(segment_nodes: Dict[int, Set[int]], export_bids: Sequence[int]) -> List[Tuple[int, str]]:
+    return [(bid, LABELS[bid][0]) for bid in export_bids if bid in segment_nodes and len(segment_nodes[bid]) > 0]
+
+
+def assign_voxel_labels(
+    mask: np.ndarray,
+    verts: np.ndarray,
+    segment_nodes: Dict[int, Set[int]],
+    export_items: Sequence[Tuple[int, str]],
+) -> np.ndarray:
+    all_pts, all_lbl = [], []
+    for export_label, (bid, _) in enumerate(export_items, start=1):
+        pts = verts[list(segment_nodes[bid])]
+        all_pts.append(pts)
+        all_lbl.append(np.full(len(pts), export_label, dtype=np.uint16))
+
+    if not all_pts:
+        raise RuntimeError("No valid segment nodes are available for export.")
+
+    tree = cKDTree(np.vstack(all_pts))
+    labels = np.concatenate(all_lbl)
+    voxels = np.argwhere(mask)
+    labelmap = np.zeros(mask.shape, dtype=np.uint16)
+    _, nearest = tree.query(voxels, k=1)
+    labelmap[tuple(voxels.T)] = labels[nearest]
+    return labelmap
+
+
+def make_slicer_segmentation(
+    labelmap: np.ndarray,
+    export_items: Sequence[Tuple[int, str]],
+    ct_path: Optional[Path] = None,
+    fallback_header: Optional[dict] = None,
+) -> Tuple[np.ndarray, dict, List[Tuple[int, str]]]:
+    segment_arrays = []
+    segment_meta = []
+
+    for export_label, (bid, name) in enumerate(export_items, start=1):
+        seg = (labelmap == export_label).astype(np.uint8)
+        if seg.sum() > 0:
+            segment_arrays.append(seg)
+            segment_meta.append((bid, name))
+
+    if not segment_arrays:
+        raise RuntimeError("All exported segments are empty.")
+
+    seg_data = np.stack(segment_arrays, axis=0)
+    header = {
+        "type": "uint8",
+        "dimension": 4,
+        "sizes": np.array(seg_data.shape, dtype=np.int64),
+        "kinds": ["list", "domain", "domain", "domain"],
+        "encoding": "gzip",
+        "Segmentation_MasterRepresentation": "Binary labelmap",
+        "Segmentation_ContainedRepresentationNames": "Binary labelmap",
+    }
+
+    if ct_path is not None:
+        ct_img = nib.load(str(ct_path))
+        affine = ct_img.affine
+        header["space"] = "right-anterior-superior"
+        header["space origin"] = affine[:3, 3].astype(float)
+        header["space directions"] = np.vstack([
+            [np.nan, np.nan, np.nan],
+            affine[:3, 0],
+            affine[:3, 1],
+            affine[:3, 2],
+        ]).astype(float)
+    elif fallback_header is not None:
+        for key in ("space", "space origin", "space directions", "measurement frame"):
+            if key in fallback_header:
+                header[key] = fallback_header[key]
+
+    for i, (bid, name) in enumerate(segment_meta):
+        color = LABELS[bid][1]
+        nz = np.argwhere(segment_arrays[i] > 0)
+        xmin, ymin, zmin = nz.min(axis=0)
+        xmax, ymax, zmax = nz.max(axis=0)
+
+        header[f"Segment{i}_ID"] = f"Segment_{i + 1}"
+        header[f"Segment{i}_Name"] = name
+        header[f"Segment{i}_NameAutoGenerated"] = "0"
+        header[f"Segment{i}_Color"] = f"{color[0]} {color[1]} {color[2]}"
+        header[f"Segment{i}_ColorAutoGenerated"] = "0"
+        header[f"Segment{i}_Layer"] = str(i)
+        header[f"Segment{i}_LabelValue"] = "1"
+        header[f"Segment{i}_Extent"] = f"{xmin} {xmax} {ymin} {ymax} {zmin} {zmax}"
+
+    return seg_data, header, segment_meta
+
+
+def write_segment_table(txt_path: Path, segment_meta: Sequence[Tuple[int, str]]) -> None:
+    lines = ["=== FINAL SEGMENTS ==="]
+    for i, (bid, name) in enumerate(segment_meta, start=1):
+        lines.append(f"{i:2d}. {name} (bid={bid})")
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def print_segment_table(segment_meta: Sequence[Tuple[int, str]]) -> None:
+    print("\n=== FINAL SEGMENTS ===")
+    for i, (bid, name) in enumerate(segment_meta, start=1):
+        print(f"{i:2d}. {name} (bid={bid})")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Label bronchial-tree branches from an airway .nrrd / .seg.nrrd mask."
+    )
+    parser.add_argument("--input", required=True, type=Path, help="Input airway .nrrd or .seg.nrrd file.")
+    parser.add_argument("--output", type=Path, default=None, help="Output Slicer .seg.nrrd path.")
+    parser.add_argument("--txt", type=Path, default=None, help="Output text table path.")
+    parser.add_argument("--ct", type=Path, default=None, help="Reference CT .nii/.nii.gz for geometry metadata.")
+    parser.add_argument("--airway-value", type=int, default=1, help="Voxel value of the airway mask. Default: 1.")
+    parser.add_argument("--ap-sign", type=float, default=1.0, choices=[-1.0, 1.0], help="Use -1 if AP assignment is reversed.")
+    parser.add_argument("--min-subtree-size", type=int, default=5, help="Minimum skeleton component size for branch classification.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = args.input
+    output_path = args.output or input_path.with_name(input_path.stem.replace(".seg", "") + "_BRANCHES.seg.nrrd")
+    txt_path = args.txt or output_path.with_suffix(".txt")
+    print("The entire process may take around 2-3 minutes depending on the airway complexity and hardware. Please wait until completion.")
+
+    mask, input_header = load_airway_mask(input_path, airway_value=args.airway_value)
+    labeler = BronchialBranchLabeler(mask, ap_sign=args.ap_sign, min_subtree_size=args.min_subtree_size)
+    segment_nodes = labeler.run()
+
+    export_items = build_export_items(segment_nodes, DEFAULT_EXPORT_BIDS)
+    labelmap = assign_voxel_labels(mask, labeler.verts, segment_nodes, export_items)
+    seg_data, header, segment_meta = make_slicer_segmentation(
+        labelmap,
+        export_items,
+        ct_path=args.ct,
+        fallback_header=input_header,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    txt_path.parent.mkdir(parents=True, exist_ok=True)
+    nrrd.write(str(output_path), seg_data, header)
+    write_segment_table(txt_path, segment_meta)
+    print_segment_table(segment_meta)
+    print(f"\nSaved NRRD: {output_path}")
+    print(f"Saved TXT : {txt_path}")
+
+
+if __name__ == "__main__":
+    main()
